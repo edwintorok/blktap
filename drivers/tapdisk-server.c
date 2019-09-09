@@ -334,7 +334,7 @@ tapdisk_server_open_tlog(void)
 	int err = 0;
 
 	if (server.name)
-		err = tlog_open(server.name, server.facility, TLOG_WARN);
+		err = tlog_open(server.name, server.facility, TLOG_DBG);
 
 	return err;
 }

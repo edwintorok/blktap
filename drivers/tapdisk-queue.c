@@ -129,6 +129,7 @@ complete_tiocb(struct tqueue *queue, struct tiocb *tiocb, unsigned long res)
 	int err;
 	struct iocb *iocb = &tiocb->iocb;
 
+	DBG("complete_tiocb: %lu, nbytes: %lu", res, iocb->u.c.nbytes);
 	if (res == iocb->u.c.nbytes)
 		err = 0;
 	else if ((int)res < 0)

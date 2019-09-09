@@ -32,6 +32,7 @@
 #define __IO_OPTIMIZE_H__
 
 #include <libaio.h>
+#include <sys/uio.h>
 
 struct opio;
 
@@ -40,10 +41,13 @@ struct opio_list {
 	struct opio        *tail;
 };
 
+#define UIO_FASTIOV 8
+#define OPIO_MAGIC 0x4f50494f
+
 struct opio {
-	char               *buf;
-	unsigned long       nbytes;
-	long long           offset;
+        unsigned long      opio_magic;
+	struct iocb        orig_iocb;
+	struct iovec       iov[UIO_FASTIOV];
 	void               *data;
 	struct iocb        *iocb;
 	struct io_event     event;

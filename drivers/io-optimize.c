@@ -41,7 +41,9 @@
 
 #include "io-optimize.h"
 #include "tapdisk-log.h"
+#include "debug.h"
 
+#define DEBUG
 #if (!defined(TEST) && defined(DEBUG))
 #define DBG(ctx, f, a...) tlog_write(TLOG_DBG, f, ##a)
 #elif defined(TEST)
@@ -112,41 +114,67 @@ free_opio(struct opioctx *ctx, struct opio *op)
 static inline void
 restore_iocb(struct opio *op)
 {
+        ASSERT(op);
+        ASSERT(op->opio_magic == OPIO_MAGIC);
 	struct iocb *io = op->iocb;
+	ASSERT(io);
 
-	io->data        = op->data;
-	io->u.c.buf     = op->buf;
-	io->u.c.nbytes  = op->nbytes;
+	*io = op->orig_iocb;
+}
+
+static struct opio*
+opio_cast(void *p)
+{
+    struct opio *opio = p;
+    ASSERT(opio);
+    ASSERT(opio->opio_magic == OPIO_MAGIC);
+    return opio;
+}
+
+static int iocb_vectorized(io_iocb_cmd_t op)
+{
+	switch (op) {
+		case IO_CMD_PREAD:
+			return IO_CMD_PREADV;
+		case IO_CMD_PWRITE:
+			return IO_CMD_PWRITEV;
+		default:
+			return op;
+	}
 }
 
 static inline int
 iocb_optimized(struct opioctx *ctx, struct iocb *io)
 {
-	unsigned long iop   = (unsigned long)io->data;
-	unsigned long start = (unsigned long)ctx->opios;
-	unsigned long end   = start + (ctx->num_opios * sizeof(struct opio));
+	return iocb_vectorized(io->aio_lio_opcode) == io->aio_lio_opcode;
+}
 
-	return (iop >= start && iop < end);
+static inline size_t
+iocb_nbytes(const struct iocb* io)
+{
+    if (iocb_vectorized(io->aio_lio_opcode) == io->aio_lio_opcode) {
+	size_t sum = 0, iovcnt = io->u.c.nbytes, i;
+	const struct iovec *iovec = io->u.c.buf;
+	for(i=0;i<iovcnt;i++) {
+                ASSERT(iovec[i].iov_len > 0);
+		sum += iovec[i].iov_len;
+	}
+        return sum;
+    }
+    return io->u.c.nbytes;
 }
 
 static inline int
 contiguous_sectors(struct iocb *l, struct iocb *r)
 {
-	return (l->u.c.offset + l->u.c.nbytes == r->u.c.offset);
-}
-
-static inline int
-contiguous_buffers(struct iocb *l, struct iocb *r)
-{
-	return (l->u.c.buf + l->u.c.nbytes == r->u.c.buf);
+	return (l->u.c.offset + iocb_nbytes(l) == r->u.c.offset);
 }
 
 static inline int
 contiguous_iocbs(struct iocb *l, struct iocb *r)
 {
 	return ((l->aio_fildes == r->aio_fildes) &&
-		contiguous_sectors(l, r) &&
-		contiguous_buffers(l, r));
+		contiguous_sectors(l, r));
 }
 
 static inline void
@@ -164,10 +192,8 @@ opio_iocb_init(struct opioctx *ctx, struct iocb *io)
 	if (!op)
 		return NULL;
 
-	op->buf    = io->u.c.buf;
-	op->nbytes = io->u.c.nbytes;
-	op->offset = io->u.c.offset;
-	op->data   = io->data;
+        op->opio_magic = OPIO_MAGIC;
+	op->orig_iocb = *io;
 	op->iocb   = io;
 	io->data   = op;
 
@@ -180,7 +206,7 @@ static inline struct opio *
 opio_get(struct opioctx *ctx, struct iocb *io)
 {
 	if (iocb_optimized(ctx, io))
-		return (struct opio *)io->data;
+		return opio_cast(io->data);
 	else
 	        return opio_iocb_init(ctx, io);
 }
@@ -199,25 +225,95 @@ merge_tail(struct opioctx *ctx, struct iocb *head, struct iocb *io)
 		return -ENOMEM;
 
 	opio->head        = ophead;
-	head->u.c.nbytes += io->u.c.nbytes;
+
+	if (iocb_vectorized(head->aio_lio_opcode) != head->aio_lio_opcode) {
+		struct iovec *iovec = &ophead->iov[0];
+		iovec->iov_base = head->u.c.buf;
+		iovec->iov_len = head->u.c.nbytes;
+                ASSERT(iovec->iov_len > 0);
+                void *data = head->data;
+
+		switch(io->aio_lio_opcode) {
+			case IO_CMD_PREAD:
+				io_prep_preadv(head, head->aio_fildes, iovec, 1, head->u.c.offset);
+				break;
+			case IO_CMD_PWRITE:
+				io_prep_pwritev(head, head->aio_fildes, iovec, 1, head->u.c.offset);
+				break;
+			default:
+				ASSERT(0);
+		}
+                head->data = data;
+		ASSERT(data == ophead);
+	}
+	ASSERT(!iocb_optimized(ctx, io));
+	struct iovec *iovec = &ophead->iov[head->u.c.nbytes++];
+	iovec->iov_base = io->u.c.buf;
+	iovec->iov_len = io->u.c.nbytes;
+        ASSERT(iovec->iov_len > 0);
 	ophead->list.tail = ophead->list.tail->next = opio;
-	
 	return 0;
 }
 
 static int
 merge(struct opioctx *ctx, struct iocb *head, struct iocb *io)
 {
-	if (head->aio_lio_opcode != io->aio_lio_opcode)
+	if (iocb_vectorized(head->aio_lio_opcode) != iocb_vectorized(io->aio_lio_opcode))
 		return -EINVAL;
 
 	if (!contiguous_iocbs(head, io))
 		return -EINVAL;
 
-	return merge_tail(ctx, head, io);		
+        /* otherwise we overflow and overwrite other values in the record */
+        if(iocb_optimized(ctx, head) && head->u.c.nbytes == UIO_FASTIOV)
+            return -EINVAL;
+
+	return merge_tail(ctx, head, io);
 }
 
 #if (defined(TEST) || defined(DEBUG))
+/******************************************************************************
+debug print functions
+******************************************************************************/
+static inline void
+__print_iocb(struct opioctx *ctx, struct iocb *io, char *prefix)
+{
+	if(iocb_vectorized(io->aio_lio_opcode) == io->aio_lio_opcode) {
+		const struct iovec *iov = io->u.c.buf;
+		unsigned iovcnt = io->u.c.nbytes;
+		unsigned i;
+
+		DBG(ctx, "%soff: %08llx, type: %s, data: %08lx, optimized: 1\n",
+		    prefix, io->u.c.offset, io->aio_lio_opcode == IO_CMD_PREADV ? "preadv" : "pwritev",
+		    (unsigned long)io->data);
+		for(i=0;i<iovcnt;i++) {
+			DBG(ctx, "%s\tnbytes: %04lx, buf: %p\n", prefix, iov[i].iov_len, iov[i].iov_base);
+		}
+	} else
+		DBG(ctx, "%soff: %08llx, nbytes: %04lx, buf: %p, type: %s, data: %08lx,"
+				" optimized: %d\n", prefix, io->u.c.offset, io->u.c.nbytes, 
+				io->u.c.buf, (io->aio_lio_opcode == IO_CMD_PREAD ? "read" : "write"),
+				(unsigned long)io->data, iocb_optimized(ctx, io));
+}
+
+#define print_iocb(ctx, io) __print_iocb(ctx, io, "")
+
+static void
+print_events(struct opioctx *ctx, struct io_event *events, int num_events)
+{
+	int i;
+	struct iocb *io;
+
+	for (i = 0; i < num_events; i++) {
+		io = events[i].obj;
+		print_iocb(ctx, io);
+	}
+}
+
+/******************************************************************************
+end debug print functions
+******************************************************************************/
+
 static void
 print_optimized_iocbs(struct opioctx *ctx, struct opio *op, int *cnt)
 {
@@ -245,7 +341,7 @@ print_merged_iocbs(struct opioctx *ctx, struct iocb **iocbs, int num_iocbs)
 		__print_iocb(ctx, io, pref);
 
 		if (iocb_optimized(ctx, io)) {
-			op = (struct opio *)io->data;
+			op = opio_cast(io->data);
 			print_optimized_iocbs(ctx, op->next, &cnt);
 		}
 	}
@@ -286,7 +382,7 @@ expand_iocb(struct opioctx *ctx, struct iocb **queue, struct iocb *io)
 	struct opio *op, *next;
 
 	idx = 0;
-	op  = (struct opio *)io->data;
+	op  = opio_cast(io->data);
 	while (op) {
 		next = op->next;
 		restore_iocb(op);
@@ -332,10 +428,13 @@ expand_event(struct opioctx *ctx,
 	struct opio *ophead, *op, *next;
 
 	io     = event->obj;
-	ophead = (struct opio *)io->data;
+	ophead = opio_cast(io->data);
 	op     = ophead;
 
-	if (event->res == io->u.c.nbytes)
+        size_t nbytes = iocb_nbytes(io);
+
+	DBG(ctx, "events->res: %lu, nbytes: %lu", event->res, (unsigned long)nbytes);
+	if (event->res == nbytes)
 		err = 0;
 	else if ((int)event->res < 0)
 		err = (int)event->res;
@@ -346,7 +445,8 @@ expand_event(struct opioctx *ctx,
 		next    = op->next;
 		ep      = &queue[idx++];
 		ep->obj = op->iocb;
-		ep->res = (err ? err : op->nbytes);
+		ep->res = (err ? err : op->orig_iocb.u.c.nbytes);
+		DBG(ctx, "ep->res: %lu", ep->res);
 		restore_iocb(op);
 		free_opio(ctx, op);
 		op      = next;
@@ -361,7 +461,7 @@ io_split(struct opioctx *ctx, struct io_event *events, int num)
 	int on_queue;
 	struct iocb *io;
 	struct io_event *ep, *q;
-	
+
 	if (!num)
 		return 0;
 
@@ -376,27 +476,10 @@ io_split(struct opioctx *ctx, struct io_event *events, int num)
 		else
 			on_queue = expand_event(ctx, ep, events, on_queue);
 	}
+	print_events(ctx, events, on_queue);
 
 	return on_queue;
 }
-
-/******************************************************************************
-debug print functions
-******************************************************************************/
-static inline void
-__print_iocb(struct opioctx *ctx, struct iocb *io, char *prefix)
-{
-	DBG(ctx, "%soff: %08llx, nbytes: %04lx, buf: %p, type: %s, data: %08lx,"
-	    " optimized: %d\n", prefix, io->u.c.offset, io->u.c.nbytes, 
-	    io->u.c.buf, (io->aio_lio_opcode == IO_CMD_PREAD ? "read" : "write"),
-	    (unsigned long)io->data, iocb_optimized(ctx, io));
-}
-
-#define print_iocb(ctx, io) __print_iocb(ctx, io, "")
-
-/******************************************************************************
-end debug print functions
-******************************************************************************/
 
 #if defined(TEST)
 
@@ -505,7 +588,7 @@ simulate_io(struct iocb **iocbs, struct io_event *events, int num_iocbs)
 		io      = iocbs[i];
 		ep      = &events[i];
 		ep->obj = io;
-		ep->res = (random() % 10 < 8 ? io->u.c.nbytes : 0);
+		ep->res = (random() % 10 < 8 ? iocb_nbytes(io) : 0);
 	}
 
 	return done;
@@ -522,7 +605,7 @@ process_events(struct opioctx *ctx,
 		io = events[i].obj;
 		print_iocb(ctx, io);
 		if (data_idx(io->data) != (io - iocb_list)) {
-			printf("corrupt data! data_idx = %d, io = %d\n",
+			printf("corrupt data! data_idx = %d, io = %ld\n",
 			       data_idx(io->data), (io - iocb_list));
 			exit(-1);
 		}
@@ -557,18 +640,6 @@ print_iocbs(struct opioctx *ctx, struct iocb **iocbs, int num_iocbs)
 		io = iocbs[i];
 		snprintf(pref, 10, "%d: ", i);
 		__print_iocb(ctx, io, pref);
-	}
-}
-
-static void
-print_events(struct opioctx *ctx, struct io_event *events, int num_events)
-{
-	int i;
-	struct iocb *io;
-
-	for (i = 0; i < num_events; i++) {
-		io = events[i].obj;
-		print_iocb(ctx, io);
 	}
 }
 
@@ -608,7 +679,7 @@ main(int argc, char **argv)
 		}
 	}
 
-	printf("Running %d tests with %d iocbs on %llu sectors, seed = %d\n",
+	printf("Running %d tests with %d iocbs on %lu sectors, seed = %d\n",
 	       num_runs, num_iocbs, num_secs, seed);
 
 	srand(seed);
