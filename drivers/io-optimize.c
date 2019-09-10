@@ -243,8 +243,6 @@ merge_tail(struct opioctx *ctx, struct iocb *head, struct iocb *io)
 			default:
 				ASSERT(0);
 		}
-		#define RWF_HIPRI 1
-		((uint8_t*)head)[12] |= RWF_HIPRI;/* from rossla's branch */
                 head->data = data;
 		ASSERT(data == ophead);
 	}
