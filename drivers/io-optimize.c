@@ -43,7 +43,7 @@
 #include "tapdisk-log.h"
 #include "debug.h"
 
-#define DEBUG
+//#define DEBUG
 #if (!defined(TEST) && defined(DEBUG))
 #define DBG(ctx, f, a...) tlog_write(TLOG_DBG, f, ##a)
 #elif defined(TEST)
@@ -347,6 +347,7 @@ print_merged_iocbs(struct opioctx *ctx, struct iocb **iocbs, int num_iocbs)
 	}
 }
 #else
+#define print_events(...)
 #define print_optimized_iocbs(...)
 #define print_merged_iocbs(...)
 #endif
