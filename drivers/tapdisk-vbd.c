@@ -1189,8 +1189,10 @@ tapdisk_vbd_complete_vbd_request(td_vbd_t *vbd, td_vbd_request_t *vreq)
 		if (vreq->error &&
 		    tapdisk_vbd_request_should_retry(vbd, vreq))
 			tapdisk_vbd_move_request(vreq, &vbd->failed_requests);
-		else
+		else {
 			tapdisk_vbd_move_request(vreq, &vbd->completed_requests);
+                        tapdisk_vbd_kick(vbd);
+                }
 	}
 }
 

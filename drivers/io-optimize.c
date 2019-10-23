@@ -258,6 +258,7 @@ merge_tail(struct opioctx *ctx, struct iocb *head, struct iocb *io)
 static int
 merge(struct opioctx *ctx, struct iocb *head, struct iocb *io)
 {
+	return -EINVAL;
 	if (iocb_vectorized(head->aio_lio_opcode) != iocb_vectorized(io->aio_lio_opcode))
 		return -EINVAL;
 

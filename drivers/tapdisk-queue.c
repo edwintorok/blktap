@@ -446,6 +446,47 @@ tapdisk_lio_ack_event(struct tqueue *queue)
 	}
 }
 
+struct aio_ring {
+	unsigned id;		 /** kernel internal index number */
+	unsigned nr;		 /** number of io_events */
+	unsigned head;
+	unsigned tail;
+
+	unsigned magic;
+	unsigned compat_features;
+	unsigned incompat_features;
+	unsigned header_length;	/** size of aio_ring */
+
+	struct io_event events[0];
+};
+
+#define AIO_RING_MAGIC	0xa10a10a1
+#define read_barrier()	__asm__ __volatile__("": : :"memory")
+static int user_io_getevents(io_context_t aio_ctx, unsigned int max,
+			     struct io_event *events)
+{
+	long i = 0;
+	unsigned head;
+	struct aio_ring *ring = (struct aio_ring*) aio_ctx;
+
+	while (i < max) {
+		head = ring->head;
+
+		if (head == ring->tail) {
+			/* There are no more completions */
+			break;
+		} else {
+			/* There is another completion to reap */
+			events[i] = ring->events[head];
+			read_barrier();
+			ring->head = (head + 1) % ring->nr;
+			i++;
+		}
+	}
+
+	return i;
+}
+
 static void
 tapdisk_lio_event(event_id_t id, char mode, void *private)
 {
@@ -456,12 +497,13 @@ tapdisk_lio_event(event_id_t id, char mode, void *private)
 	struct tiocb *tiocb;
 	struct io_event *ep;
 
-	tapdisk_lio_ack_event(queue);
+	if (mode != 0x42)
+		tapdisk_lio_ack_event(queue);
 
 	lio   = queue->tio_data;
 	/* io_getevents() invoked via the libaio wrapper does not set errno but
 	 * instead returns -errno on error */
-	while ((ret = io_getevents(lio->aio_ctx, 0, queue->size, lio->aio_events, NULL)) < 0) {
+	while ((ret = user_io_getevents(lio->aio_ctx, queue->size, lio->aio_events)) < 0) {
 		/* Permit some errors to retry */
 		if (ret == -EINTR) continue;
 		ERR(ret, "io_getevents() non-retryable error");
@@ -522,7 +564,7 @@ static int
 tapdisk_lio_submit(struct tqueue *queue)
 {
 	struct lio *lio = queue->tio_data;
-	int merged, submitted, err = 0;
+	int merged, submitted, err = 0, i;
 
 	if (!queue->queued)
 		return 0;
@@ -530,7 +572,17 @@ tapdisk_lio_submit(struct tqueue *queue)
 	tapdisk_filter_iocbs(queue->filter, queue->iocbs, queue->queued);
 	merged    = io_merge(&queue->opioctx, queue->iocbs, queue->queued);
 	tapdisk_lio_set_eventfd(queue, merged, queue->iocbs);
-	submitted = io_submit(lio->aio_ctx, merged, queue->iocbs);
+	
+	submitted = 0;
+	for (i=0;i<merged;i++) {
+		submitted += io_submit(lio->aio_ctx, 1, &queue->iocbs[i]);
+		queue->iocbs_pending++;
+		queue->tiocbs_pending++;
+		queue->queued--;
+		tapdisk_lio_event(0, 0x42, queue);
+	}
+//	submitted = io_submit(lio->aio_ctx, merged, queue->iocbs);
+//	tapdisk_lio_event(0, 0x42, queue);
 
 	DBG("queued: %d, merged: %d, submitted: %d\n",
 	    queue->queued, merged, submitted);
@@ -541,9 +593,9 @@ tapdisk_lio_submit(struct tqueue *queue)
 	} else if (submitted < merged)
 		err = -EIO;
 
-	queue->iocbs_pending  += submitted;
+/*	queue->iocbs_pending  += submitted;
 	queue->tiocbs_pending += queue->queued;
-	queue->queued          = 0;
+	queue->queued          = 0; */
 
 	if (err)
 		queue->tiocbs_pending -= 
