@@ -446,6 +446,47 @@ tapdisk_lio_ack_event(struct tqueue *queue)
 	}
 }
 
+struct aio_ring {
+	unsigned id;		 /** kernel internal index number */
+	unsigned nr;		 /** number of io_events */
+	unsigned head;
+	unsigned tail;
+
+	unsigned magic;
+	unsigned compat_features;
+	unsigned incompat_features;
+	unsigned header_length;	/** size of aio_ring */
+
+	struct io_event events[0];
+};
+
+#define AIO_RING_MAGIC	0xa10a10a1
+#define read_barrier()	__asm__ __volatile__("": : :"memory")
+static int user_io_getevents(io_context_t aio_ctx, unsigned int max,
+			     struct io_event *events)
+{
+	long i = 0;
+	unsigned head;
+	struct aio_ring *ring = (struct aio_ring*) aio_ctx;
+
+	while (i < max) {
+		head = ring->head;
+
+		if (head == ring->tail) {
+			/* There are no more completions */
+			break;
+		} else {
+			/* There is another completion to reap */
+			events[i] = ring->events[head];
+			read_barrier();
+			ring->head = (head + 1) % ring->nr;
+			i++;
+		}
+	}
+
+	return i;
+}
+
 static void
 tapdisk_lio_event(event_id_t id, char mode, void *private)
 {
@@ -461,7 +502,7 @@ tapdisk_lio_event(event_id_t id, char mode, void *private)
 	lio   = queue->tio_data;
 	/* io_getevents() invoked via the libaio wrapper does not set errno but
 	 * instead returns -errno on error */
-	while ((ret = io_getevents(lio->aio_ctx, 0, queue->size, lio->aio_events, NULL)) < 0) {
+	while ((ret = user_io_getevents(lio->aio_ctx, queue->size, lio->aio_events)) < 0) {
 		/* Permit some errors to retry */
 		if (ret == -EINTR) continue;
 		ERR(ret, "io_getevents() non-retryable error");
