@@ -468,6 +468,10 @@ static int user_io_getevents(io_context_t aio_ctx, unsigned int max,
 	long i = 0;
 	unsigned head;
 	struct aio_ring *ring = (struct aio_ring*) aio_ctx;
+	if (ring->magic != AIO_RING_MAGIC) {
+		ERR(EINVAL, "aio ring magic doesn't match");
+		return -1;
+	}
 
 	while (i < max) {
 		head = ring->head;
