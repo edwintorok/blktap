@@ -42,7 +42,7 @@
 #include "libvhd.h"
 #include "vhd-util.h"
 
-#define nsize     15
+#define nsize     20
 static char nbuf[nsize];
 
 static inline char *
