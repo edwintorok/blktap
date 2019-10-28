@@ -32,6 +32,7 @@
 #define _SCHEDULER_H_
 
 #include <sys/select.h>
+#include <libaio.h>
 
 #include "list.h"
 
@@ -43,16 +44,17 @@
 typedef int                          event_id_t;
 typedef void (*event_cb_t)          (event_id_t id, char mode, void *private);
 
+#define SCHEDULER_MAX_EVENTS 	     64
+
 typedef struct scheduler {
-	fd_set                       read_fds;
-	fd_set                       write_fds;
-	fd_set                       except_fds;
+	io_context_t		     poll_ctx;
+	struct iocb		     *poll_iocbs[SCHEDULER_MAX_EVENTS];
+	unsigned		     poll_niocbs;
 
 	struct list_head             events;
 
 	int                          uuid;
 	int                          uuid_overflow;
-	int                          max_fd;
 	struct timeval               timeout;
 	struct timeval               max_timeout;
 	int                          depth;

@@ -37,6 +37,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <sys/time.h>
+#include <poll.h>
 
 #include "debug.h"
 #include "tapdisk.h"
@@ -67,7 +68,7 @@
 typedef struct event {
 	char                         mode;
 	char                         dead;
-	char                         pending;
+	char			     pending;
 	char                         masked;
 
 	event_id_t                   id;
@@ -91,9 +92,16 @@ typedef struct event {
 
 	event_cb_t                   cb;
 	void                        *private;
+	struct iocb		     iocb;
 
 	struct list_head             next;
 } event_t;
+
+
+/* See select(2) */
+#define POLLIN_SET (POLLRDNORM | POLLRDBAND | POLLIN | POLLHUP | POLLERR) 
+#define POLLOUT_SET (POLLWRBAND | POLLWRNORM | POLLOUT | POLLERR)
+#define POLLEX_SET (POLLPRI)
 
 static void
 scheduler_prepare_events(scheduler_t *s)
@@ -102,32 +110,45 @@ scheduler_prepare_events(scheduler_t *s)
 	struct timeval now;
 	event_t *event;
 
-	FD_ZERO(&s->read_fds);
-	FD_ZERO(&s->write_fds);
-	FD_ZERO(&s->except_fds);
-
-	s->max_fd  = -1;
 	s->timeout = TV_SECS(SCHEDULER_MAX_TIMEOUT);
+	s->poll_niocbs = 0;
 
 	gettimeofday(&now, NULL);
 
 	scheduler_for_each_event(s, event) {
+		short mask = 0;
+
 		if (event->masked || event->dead)
 			continue;
 
+		/* see select(2) for the mapping to the poll mask */
 		if (event->mode & SCHEDULER_POLL_READ_FD) {
-			FD_SET(event->fd, &s->read_fds);
-			s->max_fd = MAX(event->fd, s->max_fd);
+		 	mask |= POLLIN_SET;
 		}
 
 		if (event->mode & SCHEDULER_POLL_WRITE_FD) {
-			FD_SET(event->fd, &s->write_fds);
-			s->max_fd = MAX(event->fd, s->max_fd);
+			mask |= POLLOUT_SET;
 		}
 
 		if (event->mode & SCHEDULER_POLL_EXCEPT_FD) {
-			FD_SET(event->fd, &s->except_fds);
-			s->max_fd = MAX(event->fd, s->max_fd);
+			mask |= POLLEX_SET;
+		}
+		if (mask) {
+			if (!s->poll_ctx) {		
+				int ret;
+				EPRINTF("io_setup called");
+				ret = io_setup(SCHEDULER_MAX_EVENTS, &s->poll_ctx);
+				if (ret < 0) {
+					EPRINTF("io_setup failed: %s\n", strerror(-ret));
+					td_panic();
+				}
+			}
+
+			ASSERT(s->poll_niocbs < sizeof(s->poll_iocbs)/sizeof(s->poll_iocbs[0]));
+			io_prep_poll(&event->iocb, event->fd, mask);
+			/* do not use io_queue_run, which would except this to be a callback! */
+			event->iocb.data = event;
+			s->poll_iocbs[s->poll_niocbs++] = &event->iocb;
 		}
 
 		if (event->mode & SCHEDULER_POLL_TIMEOUT
@@ -143,42 +164,6 @@ scheduler_prepare_events(scheduler_t *s)
 	s->timeout = TV_MIN(s->timeout, s->max_timeout);
 }
 
-static int
-scheduler_check_fd_events(scheduler_t *s, int nfds)
-{
-	event_t *event;
-
-	scheduler_for_each_event(s, event) {
-		if (!nfds)
-			break;
-
-		if (event->dead)
-			continue;
-
-		if ((event->mode & SCHEDULER_POLL_READ_FD) &&
-		    FD_ISSET(event->fd, &s->read_fds)) {
-			FD_CLR(event->fd, &s->read_fds);
-			event->pending |= SCHEDULER_POLL_READ_FD;
-			--nfds;
-		}
-
-		if ((event->mode & SCHEDULER_POLL_WRITE_FD) &&
-		    FD_ISSET(event->fd, &s->write_fds)) {
-			FD_CLR(event->fd, &s->write_fds);
-			event->pending |= SCHEDULER_POLL_WRITE_FD;
-			--nfds;
-		}
-
-		if ((event->mode & SCHEDULER_POLL_EXCEPT_FD) &&
-		    FD_ISSET(event->fd, &s->except_fds)) {
-			FD_CLR(event->fd, &s->except_fds);
-			event->pending |= SCHEDULER_POLL_EXCEPT_FD;
-			--nfds;
-		}
-	}
-
-	return nfds;
-}
 
 /**
  * Checks all scheduler events whose mode is set to SCHEDULER_POLL_TIMEOUT
@@ -212,17 +197,6 @@ scheduler_check_timeouts(scheduler_t *s)
 
 		event->pending = SCHEDULER_POLL_TIMEOUT;
 	}
-}
-
-static int
-scheduler_check_events(scheduler_t *s, int nfds)
-{
-	if (nfds)
-		nfds = scheduler_check_fd_events(s, nfds);
-
-	scheduler_check_timeouts(s);
-
-	return nfds;
 }
 
 static void
@@ -261,6 +235,23 @@ scheduler_run_events(scheduler_t *s)
 	}
 
 	return n_dispatched;
+}
+
+static void
+scheduler_process_fd_event(scheduler_t *s, const struct io_event *io_event)
+{
+	event_t *event = io_event->data;
+	short revents = io_event->res;
+
+	ASSERT(!!(event));
+	if (event->dead)
+		return;
+	if (revents & POLLIN_SET)
+		event->pending |= SCHEDULER_POLL_READ_FD;
+	if (revents & POLLOUT_SET)
+		event->pending |= SCHEDULER_POLL_WRITE_FD;
+	if (revents & POLLEX_SET)
+		event->pending |= SCHEDULER_POLL_EXCEPT_FD;
 }
 
 int
@@ -385,8 +376,9 @@ scheduler_set_max_timeout(scheduler_t *s, struct timeval timeout)
 int
 scheduler_wait_for_events(scheduler_t *s)
 {
-	int ret;
-	struct timeval tv;
+	int ret, i;
+	struct timespec ts;
+	struct io_event events[SCHEDULER_MAX_EVENTS];
 
 	s->depth++;
 	ret = 0;
@@ -399,27 +391,31 @@ scheduler_wait_for_events(scheduler_t *s)
 
 	scheduler_prepare_events(s);
 
-	tv = s->timeout;
-
 	DBG("timeout: %ld.%ld, max_timeout: %ld.%ld\n",
 	    s->timeout.tv_sec, s->timeout.tv_usec, s->max_timeout.tv_sec, s->max_timeout.tv_usec);
 
-    do {
-    	ret = select(s->max_fd + 1, &s->read_fds, &s->write_fds,
-                &s->except_fds, &tv);
-        if (ret < 0) {
-            ret = -errno;
-            ASSERT(ret);
-        }
-    } while (ret == -EINTR);
+	ret = io_submit(s->poll_ctx, s->poll_niocbs, s->poll_iocbs);
+	if (ret < 0) {
+		EPRINTF("io_submit failed: %s\n", strerror(-ret));
+		goto out;
+	}
+	ts.tv_sec = s->timeout.tv_sec;
+	ts.tv_nsec = s->timeout.tv_usec * 1000;
+    	do {
+		ret = io_getevents(s->poll_ctx, 1, sizeof(events)/sizeof(events[0]),
+				   events, &ts);
+    	} while (ret == -EINTR);
+    	s->poll_niocbs = 0;
 
-    if (ret < 0) {
-        EPRINTF("select failed: %s\n", strerror(-ret));
-        goto out;
-    }
+	if (ret < 0) {
+		EPRINTF("io_getevents failed: %s\n", strerror(-ret));
+		goto out;
+	}
 
-	ret = scheduler_check_events(s, ret);
-	BUG_ON(ret);
+	for (i=0;i<ret;i++) {
+		scheduler_process_fd_event(s, &events[i]);	
+	}
+	scheduler_check_timeouts(s);
 
 	s->timeout     = TV_SECS(SCHEDULER_MAX_TIMEOUT);
 	s->max_timeout = TV_SECS(SCHEDULER_MAX_TIMEOUT);
@@ -444,11 +440,9 @@ scheduler_initialize(scheduler_t *s)
 	s->depth = 0;
 	s->uuid_overflow = 0;
 
-	FD_ZERO(&s->read_fds);
-	FD_ZERO(&s->write_fds);
-	FD_ZERO(&s->except_fds);
-
 	INIT_LIST_HEAD(&s->events);
+
+	s->poll_ctx = 0;
 }
 
 int
