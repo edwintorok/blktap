@@ -187,6 +187,7 @@ struct td_xenblkif {
 		 */
 		int io_err;
 	} barrier;
+	bool barrier_seen;
 
 	event_id_t chkrng_event;
 	event_id_t stoppolling_event;

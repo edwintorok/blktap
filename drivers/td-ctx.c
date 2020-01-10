@@ -332,6 +332,7 @@ tapdisk_xenio_ctx_process_ring(struct td_xenblkif *blkif,
 			blkif->barrier.msg = reqs[(n_reqs - 1)];
 			blkif->barrier.io_done = false;
 			blkif->barrier.io_err = 0;
+			blkif->barrier_seen = true;
 			break;
 		}
 

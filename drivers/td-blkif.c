@@ -481,6 +481,7 @@ tapdisk_xenblkif_connect(domid_t domid, int devid, const grant_ref_t * grefs,
 	td_blkif->barrier.msg = NULL;
 	td_blkif->barrier.io_done = false;
 	td_blkif->barrier.io_err = 0;
+	td_blkif->barrier_seen = false;
 
     td_blkif->xenvbd_stats.root = NULL;
     shm_init(&td_blkif->xenvbd_stats.io_ring);

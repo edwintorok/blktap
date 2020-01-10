@@ -161,6 +161,7 @@ struct td_vbd_request {
 	int                         submitting;
 	int                         secs_pending;
 	int                         num_retries;
+	bool			    responded_early;
 	struct timeval		    ts;
 	struct timeval              last_try;
 

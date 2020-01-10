@@ -46,6 +46,7 @@ tapdisk_xenblkif_stats(struct td_xenblkif * blkif, td_stats_t * st)
     tapdisk_stats_field(st, "pool", "s", blkif->ctx->pool);
     tapdisk_stats_field(st, "domid", "d", blkif->domid);
     tapdisk_stats_field(st, "devid", "d", blkif->devid);
+    tapdisk_stats_field(st, "barrier_seen", "d", blkif->barrier_seen);
 
     tapdisk_stats_field(st, "reqs", "[");
     tapdisk_stats_val(st, "llu", blkif->stats.reqs.in);

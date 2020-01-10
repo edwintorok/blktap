@@ -538,6 +538,7 @@ tapdisk_xenblkif_complete_request(struct td_xenblkif * const blkif,
 		else
             _err = BLKIF_RSP_ERROR;
 
+	    if (!tapreq->vreq.responded_early)
 		xenio_blkif_put_response(blkif, tapreq, _err, final);
 	}
 
@@ -801,6 +802,17 @@ tapdisk_xenblkif_make_vbd_request(struct td_xenblkif * const blkif,
         tapdisk_xenblkif_complete_request(blkif,
                 msg_to_tapreq(blkif->barrier.msg), 0, 1);
         err = 0;
+    }
+    if (tapreq->msg.operation == BLKIF_OP_WRITE && blkif->barrier_seen) {
+        /* We know the guest is using write barriers, so it is safe to acknowledge writes
+         * as soon as we copied them off the ring.
+         * The guest will issue write barriers, which will report back the actual errors and wait
+         * for completion.
+         * TODO: are we guaranteed to always copy the guest's data off the ring with grant copy?
+         * this wouldn't be safe if we used grant map and the guest reused the request slot.
+         * */
+        xenio_blkif_put_response(blkif, tapreq, 0, 1);
+        vreq->responded_early = true;
     }
 out:
     return err;
