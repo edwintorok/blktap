@@ -866,12 +866,14 @@ _vhd_open(td_driver_t *driver, const char *name,
     if (flags & TD_OPEN_LOCAL_CACHE)
         vhd_flags |= VHD_FLAG_OPEN_LOCAL_CACHE;
 
+#if 0
 	/* pre-allocate for all but NFS and LVM storage */
 	driver->storage = tapdisk_storage_type(name);
 
 	if (driver->storage != TAPDISK_STORAGE_TYPE_NFS &&
 	    driver->storage != TAPDISK_STORAGE_TYPE_LVM)
 		vhd_flags |= VHD_FLAG_OPEN_PREALLOCATE;
+#endif
 
 	return __vhd_open(driver, name, encryption, vhd_flags);
 }
