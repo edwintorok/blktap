@@ -67,6 +67,7 @@
 #include <sys/mman.h>
 #include <limits.h>
 #include <dlfcn.h>
+#include <linux/falloc.h>
 
 #include "debug.h"
 #include "libvhd.h"
@@ -1567,6 +1568,22 @@ update_bat(struct vhd_state *s, uint32_t blk)
 	return 0;
 }
 
+#define EOPNOTSUPP_FALLOCATE 1
+
+static int write_zeros(struct vhd_state *s, size_t size, off_t offset)
+{
+	ASSERT(offset > 0);
+	if (!(s->vhd.eopnotsupp & EOPNOTSUPP_FALLOCATE)) {
+		if (fallocate(s->vhd.fd, FALLOC_FL_ZERO_RANGE, offset, size) < 0) {
+			if (EOPNOTSUPP != errno)
+				return -1;
+			DBG(TLOG_WARN, "fallocate EOPNOTSUPP");
+			s->vhd.eopnotsupp |= EOPNOTSUPP_FALLOCATE;
+		}
+	}
+	return pwrite(s->vhd.fd, vhd_zeros(size), size, offset);
+}
+
 static int
 allocate_block(struct vhd_state *s, uint32_t blk)
 {
@@ -1606,13 +1623,8 @@ allocate_block(struct vhd_state *s, uint32_t blk)
 	DBG(TLOG_DBG, "blk: 0x%04x, pbwo: 0x%08"PRIx64"\n",
 	    blk, s->bat.pbw_offset);
 
-	if (lseek(s->vhd.fd, offset, SEEK_SET) == (off_t)-1) {
-		ERR(s, -errno, "lseek failed\n");
-		return -errno;
-	}
-
 	size  = vhd_sectors_to_bytes(s->spb + s->bm_secs + gap);
-	count = write(s->vhd.fd, vhd_zeros(size), size);
+	count = write_zeros(s, size, offset);
 	if (count != size) {
 		err = count < 0 ? -errno : -ENOSPC;
 		ERR(s, -errno,

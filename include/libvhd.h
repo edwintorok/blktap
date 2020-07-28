@@ -140,6 +140,7 @@ struct crypto_blkcipher;
 
 struct vhd_context {
 	int                        fd;
+	int                        eopnotsupp;
 	char                      *file;
 	int                        oflags;
 	int                        is_block;
